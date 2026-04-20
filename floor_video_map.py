@@ -5,6 +5,9 @@ The script estimates a 2D pose for sampled video frames, accumulates those
 poses in a shared world/map coordinate system, computes global bounds from the
 transformed frame corners, and then renders either a single mosaic image or a
 tiled output. An optional progress video shows how the map grows over time.
+
+Author: Lennart A. Conrad
+Copyright (c) 2026 Lennart A. Conrad
 """
 
 from __future__ import annotations
@@ -34,6 +37,9 @@ DEFAULT_OUTPUT = "mosaic.png"
 DEFAULT_VIDEO_WIDTH = 1280
 DEFAULT_VIDEO_HEIGHT = 720
 DEFAULT_VIDEO_CODEC = "mp4v"
+
+__author__ = "Lennart A. Conrad"
+__copyright__ = "Copyright (c) 2026 Lennart A. Conrad"
 
 
 @dataclass

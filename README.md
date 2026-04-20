@@ -4,6 +4,8 @@
 
 This repository contains a downward-facing vehicle video mapping system prepared for **紫荆书院**, **Tsinghua University**, for **Challenge Cup** project presentation and engineering demonstration.
 
+Author: **Lennart A. Conrad**
+
 The core program, `floor_video_map.py`, converts a floor-facing or road-facing video stream into a 2D stitched map. Unlike a phone panorama, it does not assume motion is horizontal. It estimates per-frame motion in map space, accumulates 2D transforms, computes global bounds from transformed frame corners, and renders a map that can grow in any direction.
 
 ## What The Project Does
@@ -228,6 +230,18 @@ Current limitations:
 - automated crop suggestion
 - quantitative trajectory evaluation against external references
 
+## Author And Copyright
+
+- Author: **Lennart A. Conrad**
+- Copyright: **Copyright (c) 2026 Lennart A. Conrad**
+- License: [MIT](LICENSE)
+
+## Third-Party Components
+
+- This repository's original project code is attributed to **Lennart A. Conrad**.
+- Third-party libraries such as `opencv-python`, `numpy`, and `tqdm` remain under their own licenses.
+- Input videos, camera outputs, datasets, and external hardware documentation are not relicensed by this repository unless explicitly stated.
+
 ## Attribution
 
-Prepared for **紫荆书院**, **Tsinghua University**, for **Challenge Cup** project work and demonstration.
+Prepared for **紫荆书院**, **Tsinghua University**, for **Challenge Cup** project work and demonstration by **Lennart A. Conrad**.
