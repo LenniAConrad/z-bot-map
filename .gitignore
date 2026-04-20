@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local experiment outputs
+video_runs/
+tiles/
+runs/
+captures/
+thermal_usb_test/
+
+# Generated mosaics, previews, logs, and videos
+mosaic*.png
+preview*.png
+trajectory*.png
+poses*.csv
+poses*.json
+*_progress.mp4
+comparison*.mp4
+
