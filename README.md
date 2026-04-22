@@ -43,6 +43,7 @@ This makes it suitable for:
 
 ```text
 floor_video_map.py    main CLI program
+live_webcam_map.py    live webcam preview and memory-map runner
 requirements.txt      Python dependencies
 README.md             project overview and usage
 video_runs/           local experiment outputs (ignored by git)
@@ -79,6 +80,37 @@ If no input path is given, the program auto-detects the first common video file 
 python floor_video_map.py --output mosaic.png
 ```
 
+Use a webcam for live preview:
+
+```bash
+python live_webcam_map.py --source 0
+```
+
+The live window shows the camera on the left and the fixed-pixel memory map on the right. Keyboard controls are printed in the terminal: `q` or `Esc` quits, `r` resets the map, and `s` saves the current mosaic.
+
+If the image is mirrored or upside down, add:
+
+```bash
+python live_webcam_map.py --source 0 --mirror
+python live_webcam_map.py --source 0 --flip-vertical
+```
+
+For a faster live preview on weaker machines:
+
+```bash
+python live_webcam_map.py --source 0 \
+  --detector orb \
+  --nfeatures 1500 \
+  --max-dim 480 \
+  --process-every 2
+```
+
+You can also test the live viewer with a normal video file:
+
+```bash
+python live_webcam_map.py --source input.mp4 --output live_mosaic.png
+```
+
 ## Recommended Commands
 
 General RGB or floor-texture mapping:
@@ -93,6 +125,7 @@ python floor_video_map.py input.mp4 \
   --every 1 \
   --model partial-affine \
   --detector sift \
+  --render-poses accepted \
   --blend best \
   --preview-blend best \
   --draw-trajectory \
@@ -119,8 +152,9 @@ python floor_video_map.py input.avi \
   --min-matches 8 \
   --min-inliers 6 \
   --min-inlier-ratio 0.2 \
-  --blend best \
-  --preview-blend best \
+  --render-poses tracked \
+  --blend memory \
+  --memory-alpha 0.45 \
   --use-ecc \
   --write-poses poses.csv \
   --write-json poses.json \
@@ -170,8 +204,11 @@ tiles/manifest.json      tiled-render metadata
 - `--max-dim`: resize the input frame for speed
 - `--detector sift|orb`: feature extractor
 - `--model translation|partial-affine|affine|homography`: motion model
-- `--blend last|average|feather|max|smart|best`: overlap blending strategy
-- `--preview-blend inherit|last|average|feather|max|smart|best`: preview-specific blend mode
+- `--render-poses tracked|accepted`: render every tracked frame for heat-map updates or only sparse keyframes
+- `--blend memory|last|average|feather|max|smart|best`: overlap blending strategy
+- `--memory-alpha`: update strength for fixed world-pixel memory blending
+- `--preview-blend inherit|memory|last|average|feather|max|smart|best`: preview-specific blend mode
+- `--no-lock-small-motion-updates`: disable keyframe-locked painting for sub-threshold tracked frames
 - `--min-step-px`: minimum world-space translation before accepting a frame
 - `--min-rotation-deg`: minimum rotation before accepting a frame
 - `--accept-every-frame`: disable motion-based frame filtering
@@ -189,6 +226,7 @@ Run `python floor_video_map.py --help` for the full interface.
 
 ## Blending Modes
 
+- `memory`: fixed world-pixel memory; new observations update existing map colors in place
 - `last`: newest frame overwrites old content
 - `average`: overlap averaging
 - `feather`: soft overlap weighting
@@ -196,7 +234,7 @@ Run `python floor_video_map.py --help` for the full interface.
 - `smart`: mixed strategy that feathers flat areas and preserves detail
 - `best`: picks one strong real observation per output pixel using detail, center, and tracking-quality weighting
 
-For Challenge Cup presentation and engineering readability, `best` is the recommended default because it preserves object boundaries better than averaging.
+For live thermal-map behavior, use `--render-poses tracked --blend memory`. This keeps already mapped pixels in fixed world positions while new frames update their colors. For still RGB presentation mosaics, `--render-poses accepted --blend best` remains useful because it preserves object boundaries better than averaging.
 
 ## Technical Notes
 

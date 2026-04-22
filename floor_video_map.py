@@ -19,7 +19,7 @@ import math
 import sys
 import tempfile
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Deque, Iterable, Sequence
 
@@ -172,8 +172,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accept-every-frame", action="store_true")
     parser.add_argument(
         "--blend",
-        choices=("last", "average", "feather", "max", "smart", "best"),
-        default="feather",
+        choices=("memory", "last", "average", "feather", "max", "smart", "best"),
+        default="memory",
+    )
+    parser.add_argument(
+        "--memory-alpha",
+        type=float,
+        default=0.45,
+        help=(
+            "Update strength for --blend memory. 1.0 overwrites existing world pixels; "
+            "lower values smooth thermal/noisy updates."
+        ),
+    )
+    parser.add_argument(
+        "--render-poses",
+        choices=("tracked", "accepted"),
+        default="tracked",
+        help=(
+            "Which poses to paint into the map. tracked renders every visually tracked frame; "
+            "accepted renders only motion-threshold keyframes."
+        ),
+    )
+    parser.add_argument(
+        "--no-lock-small-motion-updates",
+        action="store_false",
+        dest="lock_small_motion_updates",
+        help=(
+            "For --render-poses tracked, paint sub-threshold color updates at their raw tracked "
+            "pose instead of locking them to the last accepted keyframe pose."
+        ),
+    )
+    parser.set_defaults(lock_small_motion_updates=True)
+    parser.add_argument(
+        "--render-predicted-frames",
+        action="store_true",
+        help="Allow dead-reckoned motion-bridge frames to be painted into the map.",
     )
     parser.add_argument("--max-canvas-mp", type=float, default=250.0)
     parser.add_argument("--enable-tiling", action="store_true")
@@ -193,7 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview", help="Optional downsampled preview image path.")
     parser.add_argument(
         "--preview-blend",
-        choices=("inherit", "last", "average", "feather", "max", "smart", "best"),
+        choices=("inherit", "memory", "last", "average", "feather", "max", "smart", "best"),
         default="inherit",
         help="Blend mode for the preview image. Defaults to the main --blend mode.",
     )
@@ -1574,7 +1607,20 @@ def rotation_matrix_about_point(angle_deg: float, center_xy: tuple[float, float]
     return translate_back @ rotate @ translate_to_origin
 
 
-def apply_presentation_alignment(accepted_poses: list[FramePose]) -> None:
+def apply_pose_transform(poses: Sequence[FramePose], transform: np.ndarray) -> None:
+    for pose in poses:
+        if pose.H_frame_to_world is None or pose.corners_world is None or pose.center_world is None:
+            continue
+        pose.H_frame_to_world = transform @ pose.H_frame_to_world
+        pose.center_world = tuple(transform_points(transform, np.array([pose.center_world]))[0])
+        pose.corners_world = transform_points(transform, pose.corners_world)
+        pose.reason += "; presentation-aligned"
+
+
+def apply_presentation_alignment(
+    all_poses: Sequence[FramePose],
+    accepted_poses: Sequence[FramePose],
+) -> None:
     if len(accepted_poses) < 2:
         return
     first = accepted_poses[0].center_world
@@ -1587,13 +1633,7 @@ def apply_presentation_alignment(accepted_poses: list[FramePose]) -> None:
         return
     angle_to_right = -math.degrees(math.atan2(dy, dx))
     R = rotation_matrix_about_point(angle_to_right, first)
-    for pose in accepted_poses:
-        if pose.H_frame_to_world is None or pose.corners_world is None or pose.center_world is None:
-            continue
-        pose.H_frame_to_world = R @ pose.H_frame_to_world
-        pose.center_world = tuple(transform_points(R, np.array([pose.center_world]))[0])
-        pose.corners_world = transform_points(R, pose.corners_world)
-        pose.reason += "; presentation-aligned"
+    apply_pose_transform(all_poses, R)
 
 
 def compute_world_bounds(
@@ -1605,6 +1645,74 @@ def compute_world_bounds(
     max_x = float(np.max(all_corners[:, 0]))
     max_y = float(np.max(all_corners[:, 1]))
     return min_x, min_y, max_x, max_y
+
+
+def is_motion_bridge_pose(pose: FramePose) -> bool:
+    return "motion bridge" in pose.reason.lower()
+
+
+def is_small_motion_update_pose(pose: FramePose) -> bool:
+    return (
+        not pose.accepted
+        and pose.H_frame_to_world is not None
+        and "below thresholds" in pose.reason.lower()
+    )
+
+
+def select_render_poses(
+    all_poses: Sequence[FramePose],
+    accepted_poses: Sequence[FramePose],
+    frame_size_wh: tuple[int, int],
+    args: argparse.Namespace,
+) -> list[FramePose]:
+    """Choose the frames that paint the output map.
+
+    Accepted poses are sparse geometry keyframes. Tracked poses include valid
+    sub-threshold frames so a thermal/color map can keep updating even when the
+    robot has not moved far enough to create a new keyframe.
+    """
+
+    if args.render_poses == "accepted":
+        return list(accepted_poses)
+
+    render_poses = [
+        pose
+        for pose in all_poses
+        if pose.H_frame_to_world is not None
+        and (args.render_predicted_frames or not is_motion_bridge_pose(pose))
+    ]
+    if not args.lock_small_motion_updates:
+        return render_poses
+
+    locked_poses: list[FramePose] = []
+    last_accepted_pose: FramePose | None = None
+    width, height = frame_size_wh
+    for pose in render_poses:
+        if pose.accepted:
+            locked_poses.append(pose)
+            last_accepted_pose = pose
+            continue
+
+        if (
+            last_accepted_pose is not None
+            and last_accepted_pose.H_frame_to_world is not None
+            and is_small_motion_update_pose(pose)
+        ):
+            H_locked = last_accepted_pose.H_frame_to_world.copy()
+            center_world, corners_world = compute_frame_geometry(H_locked, width, height)
+            locked_poses.append(
+                replace(
+                    pose,
+                    H_frame_to_world=H_locked,
+                    center_world=center_world,
+                    corners_world=corners_world,
+                    reason=f"{pose.reason}; rendered at last accepted pose for pixel-memory update",
+                )
+            )
+            continue
+
+        locked_poses.append(pose)
+    return locked_poses
 
 
 def make_world_to_canvas_transform(
@@ -1626,7 +1734,7 @@ def make_world_to_canvas_transform(
 
 
 def estimate_canvas_memory_bytes(canvas_w: int, canvas_h: int, blend: str) -> int:
-    if blend == "last":
+    if blend in {"memory", "last"}:
         return canvas_w * canvas_h * (3 + 1)
     if blend == "max":
         return canvas_w * canvas_h * (3 + 1 + 1)
@@ -1735,18 +1843,18 @@ def estimate_tracking_confidence(pose: FramePose) -> float:
     return float(np.clip(confidence, 0.0, 1.0))
 
 
-def analyze_accepted_frame_content(
-    accepted_poses: Sequence[FramePose],
+def analyze_frame_content(
+    render_poses: Sequence[FramePose],
     frame_paths: dict[int, Path],
 ) -> dict[int, FrameContentAnalysis]:
-    """Analyze all accepted frames before rendering to bias overlap selection.
+    """Analyze rendered frames before rendering to bias overlap selection.
 
     The current pipeline already estimates geometry first and renders second.
-    This pass makes the content decision global as well by ranking accepted
+    This pass makes the content decision global as well by ranking rendered
     frames using sharpness, detail, and tracking confidence before stitching.
     """
 
-    if not accepted_poses:
+    if not render_poses:
         return {}
 
     sharpness_values: list[float] = []
@@ -1754,7 +1862,7 @@ def analyze_accepted_frame_content(
     tracking_values: list[float] = []
     raw_metrics: list[tuple[FramePose, float, float, float]] = []
 
-    for pose in accepted_poses:
+    for pose in render_poses:
         image = load_cached_frame(frame_paths[pose.frame_index])
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
@@ -1823,6 +1931,35 @@ def update_best_detail_layer(
     detail_score[better_mask] = detail_candidate[better_mask]
 
 
+def clamp_memory_alpha(value: float) -> float:
+    if not np.isfinite(value):
+        raise ValueError("--memory-alpha must be a finite number")
+    if value < 0.0 or value > 1.0:
+        raise ValueError("--memory-alpha must be in the range [0, 1]")
+    return float(value)
+
+
+def update_memory_canvas(
+    mosaic_bgr: np.ndarray,
+    valid_mask: np.ndarray,
+    warped_bgr: np.ndarray,
+    mask_bool: np.ndarray,
+    alpha: float,
+) -> None:
+    """Update a fixed world-pixel memory with a newly warped observation."""
+
+    new_mask = mask_bool & (valid_mask == 0)
+    update_mask = mask_bool & (valid_mask > 0)
+    if np.any(new_mask):
+        mosaic_bgr[new_mask] = warped_bgr[new_mask]
+    if np.any(update_mask) and alpha > 0.0:
+        old_pixels = mosaic_bgr[update_mask].astype(np.float32)
+        new_pixels = warped_bgr[update_mask].astype(np.float32)
+        blended = old_pixels * (1.0 - alpha) + new_pixels * alpha
+        mosaic_bgr[update_mask] = np.clip(blended, 0, 255).astype(np.uint8)
+    valid_mask[mask_bool] = 255
+
+
 def pose_to_serializable(pose: FramePose) -> dict:
     data = asdict(pose)
     if pose.H_frame_to_world is not None:
@@ -1883,26 +2020,26 @@ def write_pose_log_json(path: Path, poses: Sequence[FramePose]) -> None:
         json.dump([pose_to_serializable(pose) for pose in poses], handle, indent=2)
 
 
-def cache_accepted_frames(
+def cache_pose_frames(
     video_path: Path,
-    accepted_poses: Sequence[FramePose],
+    render_poses: Sequence[FramePose],
     crop: tuple[int, int, int, int] | None,
     args: argparse.Namespace,
 ) -> tuple[tempfile.TemporaryDirectory[str], dict[int, Path], dict[int, Path]]:
-    """Decode accepted frames once and cache processed and optional raw imagery."""
+    """Decode rendered frames once and cache processed and optional raw imagery."""
 
     temp_dir = tempfile.TemporaryDirectory(prefix="floor_video_map_")
     cache_root = Path(temp_dir.name)
-    accepted_indices = {pose.frame_index for pose in accepted_poses}
+    render_indices = {pose.frame_index for pose in render_poses}
     frame_paths: dict[int, Path] = {}
     raw_frame_paths: dict[int, Path] = {}
 
     cap = open_capture(video_path)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     start_frame, end_frame = resolve_frame_range(frame_count, args)
-    if accepted_indices:
-        start_frame = max(start_frame, min(accepted_indices))
-        end_frame = min(end_frame, max(accepted_indices))
+    if render_indices:
+        start_frame = max(start_frame, min(render_indices))
+        end_frame = min(end_frame, max(render_indices))
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     iterator: Iterable[int]
@@ -1916,7 +2053,7 @@ def cache_accepted_frames(
             ok, frame_bgr = cap.read()
             if not ok:
                 break
-            if frame_index not in accepted_indices:
+            if frame_index not in render_indices:
                 continue
             color, _ = preprocess_frame(frame_bgr, crop, args.max_dim)
             out_path = cache_root / f"frame_{frame_index:06d}.png"
@@ -1935,9 +2072,9 @@ def cache_accepted_frames(
     finally:
         cap.release()
 
-    missing = sorted(accepted_indices - set(frame_paths))
+    missing = sorted(render_indices - set(frame_paths))
     if missing:
-        raise RuntimeError(f"Missing cached accepted frames: {missing[:10]}")
+        raise RuntimeError(f"Missing cached render frames: {missing[:10]}")
     return temp_dir, frame_paths, raw_frame_paths
 
 
@@ -2006,7 +2143,7 @@ def build_overlay_lines(
     pose: FramePose,
     canvas_shape: tuple[int, int],
 ) -> list[str]:
-    lines = [f"accepted frame {pose.frame_index}  t={pose.timestamp_sec:.2f}s"]
+    lines = [f"mapped frame {pose.frame_index}  t={pose.timestamp_sec:.2f}s"]
     lines.append(f"inliers {pose.num_inliers}/{pose.num_matches}  ratio {pose.inlier_ratio:.2f}")
     lines.append(f"canvas {canvas_shape[1]}x{canvas_shape[0]}")
     lines.append(pose.reason)
@@ -2230,7 +2367,7 @@ def render_trajectory_panel(
         )
 
     lines = [
-        f"accepted {len(accepted_prefix)}",
+        f"mapped {len(accepted_prefix)}",
         f"frame {current_pose.frame_index}",
         f"t={current_pose.timestamp_sec:.2f}s",
     ]
@@ -2318,7 +2455,7 @@ def render_mosaic_single_canvas(
     canvas_h: int,
     args: argparse.Namespace,
 ) -> RenderResult:
-    """Render all accepted frames into a single canvas."""
+    """Render selected map-update frames into a single canvas."""
 
     if args.video_view == "canvas" and (
         args.output_video or args.comparison_video or args.comparison_edge_video
@@ -2328,7 +2465,7 @@ def render_mosaic_single_canvas(
                 "Warning: --video-view canvas ignores --video-width/--video-height and uses the full canvas size."
             )
 
-    if args.blend == "last":
+    if args.blend in {"memory", "last"}:
         mosaic = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         valid_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
         accum_rgb = None
@@ -2378,6 +2515,7 @@ def render_mosaic_single_canvas(
     comparison_writer: cv2.VideoWriter | None = None
     comparison_edge_writer: cv2.VideoWriter | None = None
     edge_canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    memory_alpha = clamp_memory_alpha(args.memory_alpha)
     if args.output_video:
         ensure_parent_dir(Path(args.output_video).resolve())
         fourcc = cv2.VideoWriter_fourcc(*DEFAULT_VIDEO_CODEC)
@@ -2452,7 +2590,16 @@ def render_mosaic_single_canvas(
                 borderMode=cv2.BORDER_CONSTANT,
             )
             mask_bool = warped_mask > 0
-            if args.blend == "last":
+            if args.blend == "memory":
+                update_memory_canvas(
+                    mosaic,
+                    valid_mask,
+                    warped,
+                    mask_bool,
+                    memory_alpha,
+                )
+                current_canvas = mosaic
+            elif args.blend == "last":
                 mosaic[mask_bool] = warped[mask_bool]
                 valid_mask[mask_bool] = 255
                 current_canvas = mosaic
@@ -2593,7 +2740,7 @@ def render_mosaic_single_canvas(
         if comparison_writer is not None:
             comparison_writer.release()
 
-    if args.blend in {"last", "max", "best"}:
+    if args.blend in {"memory", "last", "max", "best"}:
         mosaic_bgr = mosaic
     elif args.blend == "smart":
         mosaic_bgr = compose_smart_blend(
@@ -2667,13 +2814,30 @@ def render_preview_canvas(
     blend: str,
     preview_path: Path,
     frame_analysis: dict[int, FrameContentAnalysis] | None = None,
+    memory_alpha: float = 0.45,
 ) -> None:
     preview_transform_matrix, preview_w, preview_h, _ = preview_transform(
         T_world_to_canvas,
         canvas_w,
         canvas_h,
     )
-    if blend == "last":
+    if blend == "memory":
+        mosaic = np.zeros((preview_h, preview_w, 3), dtype=np.uint8)
+        valid_mask = np.zeros((preview_h, preview_w), dtype=np.uint8)
+        alpha = clamp_memory_alpha(memory_alpha)
+        for pose in accepted_poses:
+            image = load_cached_frame(frame_paths[pose.frame_index])
+            H = preview_transform_matrix @ pose.H_frame_to_world
+            warped = cv2.warpPerspective(image, H, (preview_w, preview_h))
+            mask = cv2.warpPerspective(
+                np.full(image.shape[:2], 255, dtype=np.uint8),
+                H,
+                (preview_w, preview_h),
+                flags=cv2.INTER_NEAREST,
+            )
+            update_memory_canvas(mosaic, valid_mask, warped, mask > 0, alpha)
+        preview_bgr, _, _ = crop_to_valid_region(mosaic, valid_mask)
+    elif blend == "last":
         mosaic = np.zeros((preview_h, preview_w, 3), dtype=np.uint8)
         valid_mask = np.zeros((preview_h, preview_w), dtype=np.uint8)
         for pose in accepted_poses:
@@ -2844,6 +3008,7 @@ def render_mosaic_tiles(
     tile_dir.mkdir(parents=True, exist_ok=True)
     manifest_tiles: list[dict] = []
     preview_blend = resolve_preview_blend(args)
+    memory_alpha = clamp_memory_alpha(args.memory_alpha)
 
     for tile_y0 in range(0, canvas_h, args.tile_size):
         for tile_x0 in range(0, canvas_w, args.tile_size):
@@ -2858,7 +3023,7 @@ def render_mosaic_tiles(
             if not relevant_poses:
                 continue
 
-            if args.blend == "last":
+            if args.blend in {"memory", "last"}:
                 tile_image = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
                 tile_valid = np.zeros((tile_h, tile_w), dtype=np.uint8)
                 tile_accum_rgb = None
@@ -2924,7 +3089,15 @@ def render_mosaic_tiles(
                     flags=cv2.INTER_NEAREST,
                 )
                 mask_bool = mask > 0
-                if args.blend == "last":
+                if args.blend == "memory":
+                    update_memory_canvas(
+                        tile_image,
+                        tile_valid,
+                        warped,
+                        mask_bool,
+                        memory_alpha,
+                    )
+                elif args.blend == "last":
                     tile_image[mask_bool] = warped[mask_bool]
                     tile_valid[mask_bool] = 255
                 elif args.blend == "max":
@@ -2994,7 +3167,7 @@ def render_mosaic_tiles(
                     tile_detail_rgb,
                     tile_detail_score,
                 )
-            elif args.blend not in {"last", "max", "best"}:
+            elif args.blend not in {"memory", "last", "max", "best"}:
                 safe_weight = np.where(tile_accum_weight > 1e-6, tile_accum_weight, 1.0)
                 tile_image = np.clip(
                     tile_accum_rgb / safe_weight[:, :, None],
@@ -3029,6 +3202,7 @@ def render_mosaic_tiles(
             preview_blend,
             Path(args.preview).resolve(),
             frame_analysis,
+            args.memory_alpha,
         )
 
     manifest = {
@@ -3043,7 +3217,7 @@ def render_mosaic_tiles(
         },
         "margin_px": args.margin_px,
         "tile_size": args.tile_size,
-        "accepted_frame_count": len(accepted_poses),
+        "rendered_frame_count": len(accepted_poses),
         "args": vars(args),
         "tiles": manifest_tiles,
     }
@@ -3118,6 +3292,7 @@ def inspect_output_limits(
 
 def main() -> int:
     args = parse_args()
+    args.memory_alpha = clamp_memory_alpha(args.memory_alpha)
     crop = parse_crop(args.crop)
     video_path = open_video_or_autodetect(args.input)
     video_info = get_video_info(video_path)
@@ -3144,14 +3319,18 @@ def main() -> int:
 
     all_poses, accepted_poses, processed_shape = compose_global_poses(video_path, crop, args)
     if args.presentation_align_motion_right:
-        apply_presentation_alignment(accepted_poses)
+        apply_presentation_alignment(all_poses, accepted_poses)
+    render_poses = select_render_poses(all_poses, accepted_poses, processed_shape, args)
+    if not render_poses:
+        raise RuntimeError("No renderable poses were available after pose selection.")
     accepted_count = len(accepted_poses)
     skipped_count = len(all_poses) - accepted_count
     print(f"Processed sampled frames: {len(all_poses)}")
     print(f"Accepted frames: {accepted_count}, skipped or rejected: {skipped_count}")
+    print(f"Rendered frames: {len(render_poses)} ({args.render_poses} poses)")
     print(f"Processed frame size: {processed_shape[0]}x{processed_shape[1]}")
 
-    bounds = compute_world_bounds(accepted_poses)
+    bounds = compute_world_bounds(render_poses)
     print(
         "World bounds: "
         f"min=({bounds[0]:.1f}, {bounds[1]:.1f}) "
@@ -3170,25 +3349,25 @@ def main() -> int:
         print(f"Wrote pose JSON: {json_path}")
     if args.trajectory:
         trajectory_path = Path(args.trajectory).resolve()
-        draw_trajectory_image(accepted_poses, bounds, trajectory_path, args.margin_px)
+        draw_trajectory_image(render_poses, bounds, trajectory_path, args.margin_px)
         print(f"Wrote trajectory image: {trajectory_path}")
 
-    cache_dir_ctx, frame_paths, raw_frame_paths = cache_accepted_frames(
+    cache_dir_ctx, frame_paths, raw_frame_paths = cache_pose_frames(
         video_path,
-        accepted_poses,
+        render_poses,
         crop,
         args,
     )
-    print(f"Cached {len(frame_paths)} accepted frames under {cache_dir_ctx.name}")
+    print(f"Cached {len(frame_paths)} render frames under {cache_dir_ctx.name}")
     preview_blend = resolve_preview_blend(args)
     needs_content_analysis = args.blend in {"smart", "best"} or preview_blend in {"smart", "best"}
     frame_analysis = (
-        analyze_accepted_frame_content(accepted_poses, frame_paths)
+        analyze_frame_content(render_poses, frame_paths)
         if needs_content_analysis
         else None
     )
     if frame_analysis:
-        print(f"Analyzed {len(frame_analysis)} accepted frames for global content ranking")
+        print(f"Analyzed {len(frame_analysis)} render frames for global content ranking")
 
     try:
         if args.enable_tiling or (canvas_w * canvas_h) / 1_000_000.0 > args.max_canvas_mp:
@@ -3198,7 +3377,7 @@ def main() -> int:
                     "Reduce the canvas size or disable tiling for this run."
                 )
             render_mosaic_tiles(
-                accepted_poses,
+                render_poses,
                 frame_paths,
                 frame_analysis,
                 video_path,
@@ -3216,7 +3395,7 @@ def main() -> int:
                 )
         else:
             render_result = render_mosaic_single_canvas(
-                accepted_poses,
+                render_poses,
                 frame_paths,
                 raw_frame_paths,
                 frame_analysis,
@@ -3232,7 +3411,7 @@ def main() -> int:
             if args.preview:
                 preview_path = Path(args.preview).resolve()
                 render_preview_canvas(
-                    accepted_poses,
+                    render_poses,
                     frame_paths,
                     T_world_to_canvas,
                     canvas_w,
@@ -3240,6 +3419,7 @@ def main() -> int:
                     preview_blend,
                     preview_path,
                     frame_analysis,
+                    args.memory_alpha,
                 )
                 print(f"Wrote preview image: {preview_path}")
             if args.output_video:
